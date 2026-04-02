@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ScaleItAll</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: Inter, -apple-system, sans-serif;
+      font-size: 12px;
+      color: #1a1a1a;
+      background: #fff;
+      padding: 16px;
+      width: 240px;
+    }
+
+    h1 {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #000;
+    }
+
+    label {
+      display: block;
+      font-weight: 500;
+      margin-bottom: 4px;
+      color: #555;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid #d0d0d0;
+      border-radius: 6px;
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="text"]:focus { border-color: #18a0fb; }
+    input[type="text"].error { border-color: #f24822; }
+
+    .error-msg {
+      color: #f24822;
+      font-size: 11px;
+      margin-top: 4px;
+      min-height: 14px;
+    }
+
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 16px;
+    }
+
+    .step-row {
+      display: flex;
+      gap: 6px;
+    }
+
+    button {
+      flex: 1;
+      padding: 7px 0;
+      border: 1px solid #d0d0d0;
+      border-radius: 6px;
+      background: #fff;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.1s, border-color 0.1s;
+    }
+    button:hover:not(:disabled) { background: #f5f5f5; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    button.primary {
+      background: #18a0fb;
+      color: #fff;
+      border-color: #18a0fb;
+      font-size: 12px;
+    }
+    button.primary:hover:not(:disabled) { background: #0d8de0; border-color: #0d8de0; }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #eee;
+      margin: 14px 0;
+    }
+
+    .progress {
+      min-height: 32px;
+      margin-top: 12px;
+      padding: 8px 10px;
+      background: #f7f7f7;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #555;
+      line-height: 1.5;
+      display: none;
+    }
+    .progress.visible { display: block; }
+    .progress.done { color: #0a7a40; background: #edfaf3; }
+    .progress.failed { color: #c0392b; background: #fdf0ee; }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 14px;
+      padding: 7px 10px;
+      background: #fff8e6;
+      border: 1px solid #f0d080;
+      border-radius: 6px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .toggle-row input[type="checkbox"] { cursor: pointer; accent-color: #e8a000; }
+    .toggle-row label { cursor: pointer; color: #7a5a00; font-weight: 500; margin: 0; }
+  </style>
+</head>
+<body>
+  <h1>ScaleItAll</h1>
+
+  <label for="factor">Faktor</label>
+  <input type="text" id="factor" placeholder="z.B. 0.667" value="" />
+  <div class="error-msg" id="factor-error"></div>
+
+  <div class="toggle-row" onclick="document.getElementById('sel-only').click()">
+    <input type="checkbox" id="sel-only" onclick="event.stopPropagation()" />
+    <label for="sel-only">Nur Auswahl skalieren</label>
+  </div>
+
+  <hr class="divider" />
+
+  <div class="steps">
+    <div class="step-row">
+      <button id="btn-step1" data-step="1">1 — Variables</button>
+      <button id="btn-step2" data-step="2">2 — Text Styles</button>
+    </div>
+    <div class="step-row">
+      <button id="btn-step3" data-step="3">3 — Effect & Paint</button>
+      <button id="btn-step4" data-step="4">4 — Canvas</button>
+    </div>
+    <button class="primary" id="btn-all">Run All</button>
+  </div>
+
+  <div class="progress" id="progress"></div>
+
+  <script>
+    const factorInput = document.getElementById('factor');
+    const factorError = document.getElementById('factor-error');
+    const progressEl = document.getElementById('progress');
+    const stepButtons = document.querySelectorAll('[data-step]');
+    const btnAll = document.getElementById('btn-all');
+    const allButtons = [...stepButtons, btnAll];
+
+    function parseFactor() {
+      const raw = factorInput.value.trim().replace(',', '.');
+      const val = parseFloat(raw);
+      if (!raw || isNaN(val) || val <= 0) return null;
+      return val;
+    }
+
+    function setError(msg) {
+      factorError.textContent = msg;
+      factorInput.classList.toggle('error', !!msg);
+    }
+
+    function setProgress(msg, state = 'running') {
+      progressEl.classList.add('visible');
+      progressEl.className = 'progress visible' + (state !== 'running' ? ' ' + state : '');
+      progressEl.textContent = msg;
+    }
+
+    function setRunning(running) {
+      allButtons.forEach(b => b.disabled = running);
+      factorInput.disabled = running;
+      document.getElementById('sel-only').disabled = running;
+    }
+
+    function sendRun(steps) {
+      setError('');
+      const factor = parseFactor();
+      if (!factor) {
+        setError('Bitte einen gültigen Faktor eingeben (> 0).');
+        return;
+      }
+      const selectionOnly = document.getElementById('sel-only').checked;
+      setRunning(true);
+      setProgress('Wird gestartet…');
+      parent.postMessage({ pluginMessage: { type: 'run', factor, steps, selectionOnly } }, '*');
+    }
+
+    stepButtons.forEach(btn => {
+      btn.addEventListener('click', () => sendRun([parseInt(btn.dataset.step)]));
+    });
+    btnAll.addEventListener('click', () => sendRun([1, 2, 3, 4]));
+
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      switch (msg.type) {
+        case 'progress':
+          setProgress(msg.text);
+          break;
+        case 'done':
+          setProgress(msg.text, 'done');
+          setRunning(false);
+          break;
+        case 'error':
+          setProgress(msg.text, 'failed');
+          setRunning(false);
+          break;
+      }
+    };
+  </script>
+</body>
+</html>

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:developers.figma.com)"
+      "WebFetch(domain:developers.figma.com)",
+      "Bash(npm run:*)"
     ]
   }
 }
