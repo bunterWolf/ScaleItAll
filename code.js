@@ -1,7 +1,7 @@
 "use strict";
 // =============================================================================
 // ScaleItAll — Plugin Logic (Figma Sandbox)
-// Spec v6.0
+// Spec v6.2
 // =============================================================================
 figma.showUI(__html__, { width: 256, height: 320, title: 'ScaleItAll' });
 // ---------------------------------------------------------------------------
@@ -296,14 +296,17 @@ async function scaleNode(node, factor, overrideMap, anchor) {
     // --- GROUP: only traverse children, write nothing ---
     if (node.type === 'GROUP')
         return;
-    // --- BOOLEAN_OPERATION: only x/y ---
-    if (node.type === 'BOOLEAN_OPERATION') {
-        scalePosition(node, factor, canWrite, anchor);
+    // --- BOOLEAN_OPERATION: skip, like GROUP ---
+    // Children of a BOOLEAN_OPERATION use the parent frame's coordinate space
+    // (not the BOOLEAN_OPERATION's local space).  The BOOLEAN_OPERATION's own
+    // x/y is just the auto-computed bounding box of its children.  Scaling it
+    // directly after children have already moved would double-scale its position.
+    if (node.type === 'BOOLEAN_OPERATION')
         return;
-    }
     // --- VECTOR: no integer rounding ---
     if (node.type === 'VECTOR') {
         scaleVectorNode(node, factor, canWrite, anchor);
+        scaleStrokes(node, factor, canWrite);
         return;
     }
     // --- SECTION: has no layoutSizing props, uses resizeWithoutConstraints ---
@@ -336,6 +339,20 @@ function scalePosition(node, factor, canWrite, anchor) {
     const parentIsAutoLayout = parent !== null &&
         'layoutMode' in parent &&
         parent.layoutMode !== 'NONE';
+    // Children of a GROUP that lives inside an AutoLayout frame store their
+    // coordinates in the AutoLayout frame's absolute space (not relative to the
+    // GROUP).  On the AutoLayout axis, the GROUP is repositioned automatically
+    // and children follow — explicitly scaling that axis conflicts with the
+    // auto-repositioning and, for TEXT nodes, with STRETCH constraint
+    // re-evaluation triggered by loadFontAsync, causing cascading position drift.
+    // The cross-axis still needs manual scaling (e.g. y in a HORIZONTAL layout).
+    const parentIsGroup = parent !== null && parent.type === 'GROUP';
+    const groupParent = parentIsGroup ? parent.parent : null;
+    const groupParentLayoutMode = groupParent !== null && 'layoutMode' in groupParent
+        ? groupParent.layoutMode
+        : 'NONE';
+    const skipX = parentIsGroup && groupParentLayoutMode === 'HORIZONTAL';
+    const skipY = parentIsGroup && groupParentLayoutMode === 'VERTICAL';
     // Write x/y only if parent is not AutoLayout, or node is absolute
     const shouldScaleXY = !parentIsAutoLayout || isAbsolute;
     if (!shouldScaleXY)
@@ -345,17 +362,46 @@ function scalePosition(node, factor, canWrite, anchor) {
     // Nested nodes use simple multiplication (their x/y is already relative
     // to their parent frame, so proportions are inherently preserved).
     const isTopLevel = parent !== null && parent.type === 'PAGE';
-    if (canWrite('x')) {
+    // Read constraints once for MAX handling below.
+    const nodeConstraints = 'constraints' in node
+        ? node.constraints
+        : null;
+    if (!skipX && canWrite('x')) {
         const x = node.x;
-        node.x = isTopLevel
-            ? anchor.x + Math.round((x - anchor.x) * factor)
-            : scale(x, factor);
+        if (!isTopLevel && (nodeConstraints === null || nodeConstraints === void 0 ? void 0 : nodeConstraints.horizontal) === 'MAX' && parent !== null && 'width' in parent) {
+            // MAX = fixed distance from the parent's right edge.  Figma re-applies it
+            // when the parent is resized, so we must not just do scale(x, factor) —
+            // that would produce a wrong right-edge distance and the node would be
+            // displaced a second time.
+            // Formula: set x so that after MAX fires (parent resize) the node ends up
+            // at exactly scale(old_x, factor).
+            //   x_pre = parent.w − new_parent.w + scale(old_x, factor)
+            const parentW = parent.width;
+            const parentFixedW = 'layoutSizingHorizontal' in parent &&
+                parent.layoutSizingHorizontal === 'FIXED';
+            const newParentW = parentFixedW ? scale(parentW, factor) : parentW;
+            node.x = parentW - newParentW + scale(x, factor);
+        }
+        else {
+            node.x = isTopLevel
+                ? anchor.x + Math.round((x - anchor.x) * factor)
+                : scale(x, factor);
+        }
     }
-    if (canWrite('y')) {
+    if (!skipY && canWrite('y')) {
         const y = node.y;
-        node.y = isTopLevel
-            ? anchor.y + Math.round((y - anchor.y) * factor)
-            : scale(y, factor);
+        if (!isTopLevel && (nodeConstraints === null || nodeConstraints === void 0 ? void 0 : nodeConstraints.vertical) === 'MAX' && parent !== null && 'height' in parent) {
+            const parentH = parent.height;
+            const parentFixedH = 'layoutSizingVertical' in parent &&
+                parent.layoutSizingVertical === 'FIXED';
+            const newParentH = parentFixedH ? scale(parentH, factor) : parentH;
+            node.y = parentH - newParentH + scale(y, factor);
+        }
+        else {
+            node.y = isTopLevel
+                ? anchor.y + Math.round((y - anchor.y) * factor)
+                : scale(y, factor);
+        }
     }
 }
 // ---------------------------------------------------------------------------
@@ -365,6 +411,27 @@ function scaleSize(node, factor, canWrite) {
     if (!('layoutSizingHorizontal' in node))
         return;
     const n = node;
+    // TEXT nodes: calling resize() always resets textAutoResize to NONE, which
+    // disables auto-sizing.  Preserve the original mode instead.
+    if (node.type === 'TEXT') {
+        const t = node;
+        const autoResize = t.textAutoResize;
+        if (autoResize === 'WIDTH_AND_HEIGHT') {
+            // Both dimensions are driven by font size — skip resize entirely.
+            // scaleTextProperties will scale fontSize; the text auto-resizes after.
+            return;
+        }
+        if (autoResize === 'HEIGHT') {
+            // Only width is fixed; scale it and restore HEIGHT mode so the height
+            // continues to auto-fit after fontSize is scaled.
+            if (n.layoutSizingHorizontal === 'FIXED' && canWrite('width')) {
+                n.resize(scale(n.width, factor), n.height);
+                t.textAutoResize = 'HEIGHT';
+            }
+            return;
+        }
+        // NONE / TRUNCATE: fall through to normal resize.
+    }
     if (n.layoutSizingHorizontal === 'FIXED' && canWrite('width')) {
         n.resize(scale(n.width, factor), n.height);
     }
@@ -443,21 +510,21 @@ function scaleStrokes(node, factor, canWrite) {
     const n = node;
     if (n.strokeWeight !== figma.mixed) {
         if (canWrite('strokeWeight'))
-            n.strokeWeight = scale(n.strokeWeight, factor);
+            n.strokeWeight = scaleExact(n.strokeWeight, factor);
     }
     else {
         const in_ = n;
         if (canWrite('strokeTopWeight'))
-            in_.strokeTopWeight = scale(in_.strokeTopWeight, factor);
+            in_.strokeTopWeight = scaleExact(in_.strokeTopWeight, factor);
         if (canWrite('strokeBottomWeight'))
-            in_.strokeBottomWeight = scale(in_.strokeBottomWeight, factor);
+            in_.strokeBottomWeight = scaleExact(in_.strokeBottomWeight, factor);
         if (canWrite('strokeLeftWeight'))
-            in_.strokeLeftWeight = scale(in_.strokeLeftWeight, factor);
+            in_.strokeLeftWeight = scaleExact(in_.strokeLeftWeight, factor);
         if (canWrite('strokeRightWeight'))
-            in_.strokeRightWeight = scale(in_.strokeRightWeight, factor);
+            in_.strokeRightWeight = scaleExact(in_.strokeRightWeight, factor);
     }
     if ('dashPattern' in n && canWrite('dashPattern')) {
-        n.dashPattern = n.dashPattern.map(v => scale(v, factor));
+        n.dashPattern = n.dashPattern.map(v => scaleExact(v, factor));
     }
 }
 // ---------------------------------------------------------------------------
@@ -634,59 +701,44 @@ function scaleVectorNode(node, factor, canWrite, anchor) {
     const hC = (_a = constraints === null || constraints === void 0 ? void 0 : constraints.horizontal) !== null && _a !== void 0 ? _a : 'MIN';
     const vC = (_b = constraints === null || constraints === void 0 ? void 0 : constraints.vertical) !== null && _b !== void 0 ? _b : 'MIN';
     // ── SCALE-involved axes ───────────────────────────────────────────────────
-    // If EITHER axis has a SCALE constraint we cannot do a partial resize:
-    // we would have to keep the SCALE axis at its original size and only resize
-    // the other axis, which is a non-uniform resize.  For vector nodes a
-    // non-uniform resize permanently distorts the path geometry and image-fill
-    // transforms (the intermediate non-square bbox bakes the distortion in
-    // before SCALE fires on parent resize).
+    // If EITHER axis has a SCALE constraint we must not rely on the parent
+    // resize to scale this vector.  Constraint changes made during a plugin
+    // transaction do not take effect before the parent's resize() call in the
+    // same transaction, so the old constraint is still applied by Figma at
+    // resize time.  For example, horizontal=SCALE + vertical=CENTER would
+    // scale only the width while leaving the height unchanged — distorting the
+    // vector.
     //
-    // Fix: ensure both axes are SCALE so the parent resize scales the vector
-    // uniformly — no manual resize needed at all.
+    // Fix: resize the vector manually and uniformly here (same factor on both
+    // axes → no path distortion), then demote any SCALE constraint to MIN so
+    // that the subsequent parent resize does not double-scale this node.
     if (hC === 'SCALE' || vC === 'SCALE') {
-        if (hC !== 'SCALE' || vC !== 'SCALE') {
-            // Promote the non-SCALE axis to SCALE for uniform parent-driven scaling.
-            node.constraints = { horizontal: 'SCALE', vertical: 'SCALE' };
-        }
-        // Delegate position and size entirely to parent resize — nothing more to do.
-        return;
-    }
-    // ── No SCALE constraint — handle manually ─────────────────────────────────
-    // Position: only write x/y when the constraint won't auto-reposition on
-    // parent resize.  MIN (fixed from top/left) needs manual scaling; CENTER,
-    // MAX, and STRETCH are repositioned automatically by Figma.
-    if (shouldScaleXY) {
-        if (hC === 'MIN' && canWrite('x')) {
-            node.x = isTopLevel
-                ? anchor.x + (node.x - anchor.x) * factor
-                : scaleExact(node.x, factor);
-        }
-        if (vC === 'MIN' && canWrite('y')) {
-            node.y = isTopLevel
-                ? anchor.y + (node.y - anchor.y) * factor
-                : scaleExact(node.y, factor);
-        }
-    }
-    // Size: STRETCH is auto-sized by parent → keep original; all others scale.
-    // Here both axes use the same factor → the resize is always uniform →
-    // no path or fill distortion.
-    const hManual = hC !== 'STRETCH' && canWrite('width');
-    const vManual = vC !== 'STRETCH' && canWrite('height');
-    if (hManual || vManual) {
         const oldX = node.x;
         const oldY = node.y;
         const oldW = node.width;
         const oldH = node.height;
         const MIN_DIM = 0.01;
-        const newW = hManual ? Math.max(MIN_DIM, scaleExact(oldW, factor)) : oldW;
-        const newH = vManual ? Math.max(MIN_DIM, scaleExact(oldH, factor)) : oldH;
+        const newW = Math.max(MIN_DIM, scaleExact(oldW, factor));
+        const newH = Math.max(MIN_DIM, scaleExact(oldH, factor));
         node.resize(newW, newH);
-        // CENTER constraint: Figma tracks the node's centre as a fraction of the
-        // parent.  After resizing, the centre shifts (top-left stays, node shrinks
-        // inward).  Slide the node so the centre fraction is preserved — Figma
-        // will then apply the correct position when the parent is resized.
-        //   new_pos = old_pos + (old_dim − new_dim) / 2
+        // Demote SCALE → MIN to prevent double-scaling when the parent is resized.
+        node.constraints = {
+            horizontal: hC === 'SCALE' ? 'MIN' : hC,
+            vertical: vC === 'SCALE' ? 'MIN' : vC,
+        };
+        // Position: SCALE and MIN axes need manual scaling; CENTER axes need the
+        // standard post-resize correction.
         if (shouldScaleXY) {
+            if ((hC === 'SCALE' || hC === 'MIN') && canWrite('x')) {
+                node.x = isTopLevel
+                    ? anchor.x + (oldX - anchor.x) * factor
+                    : scaleExact(oldX, factor);
+            }
+            if ((vC === 'SCALE' || vC === 'MIN') && canWrite('y')) {
+                node.y = isTopLevel
+                    ? anchor.y + (oldY - anchor.y) * factor
+                    : scaleExact(oldY, factor);
+            }
             if (hC === 'CENTER' && canWrite('x')) {
                 node.x = oldX + (oldW - newW) / 2;
             }
@@ -694,6 +746,46 @@ function scaleVectorNode(node, factor, canWrite, anchor) {
                 node.y = oldY + (oldH - newH) / 2;
             }
         }
+        return;
+    }
+    // ── No SCALE constraint — handle manually ─────────────────────────────────
+    // Position: MIN needs explicit scaling.  CENTER must also be scaled manually
+    // and then demoted to MIN — Figma's CENTER constraint maintains a *constant
+    // offset* from the parent's centre point (not a proportional fraction), so
+    // when the parent is resized it would displace the child by the wrong amount.
+    // MAX and STRETCH are auto-handled by the parent resize and need no manual
+    // position adjustment here.
+    if (shouldScaleXY) {
+        if ((hC === 'MIN' || hC === 'CENTER') && canWrite('x')) {
+            node.x = isTopLevel
+                ? anchor.x + (node.x - anchor.x) * factor
+                : scaleExact(node.x, factor);
+        }
+        if ((vC === 'MIN' || vC === 'CENTER') && canWrite('y')) {
+            node.y = isTopLevel
+                ? anchor.y + (node.y - anchor.y) * factor
+                : scaleExact(node.y, factor);
+        }
+    }
+    // Demote CENTER → MIN so the parent resize does not override the manually
+    // scaled position with a constant-offset repositioning.
+    if (hC === 'CENTER' || vC === 'CENTER') {
+        node.constraints = {
+            horizontal: hC === 'CENTER' ? 'MIN' : hC,
+            vertical: vC === 'CENTER' ? 'MIN' : vC,
+        };
+    }
+    // Size: STRETCH is auto-sized by parent → keep original; all others scale.
+    // Both axes use the same factor → resize is always uniform → no distortion.
+    const hManual = hC !== 'STRETCH' && canWrite('width');
+    const vManual = vC !== 'STRETCH' && canWrite('height');
+    if (hManual || vManual) {
+        const oldW = node.width;
+        const oldH = node.height;
+        const MIN_DIM = 0.01;
+        const newW = hManual ? Math.max(MIN_DIM, scaleExact(oldW, factor)) : oldW;
+        const newH = vManual ? Math.max(MIN_DIM, scaleExact(oldH, factor)) : oldH;
+        node.resize(newW, newH);
     }
 }
 // ---------------------------------------------------------------------------

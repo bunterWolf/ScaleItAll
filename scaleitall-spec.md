@@ -150,6 +150,95 @@ Alle Nodes auf allen Pages werden **bottom-up** traversiert und skaliert — Bla
 
 ---
 
+## Grundprinzip: Top-Level-Positionierung via Anchor
+
+Top-Level-Nodes (direkte Kinder einer PAGE) werden **nicht** einfach mit `x * factor` skaliert. Stattdessen wird die Position relativ zum **Bounding-Box-Anker** aller Top-Level-Frames berechnet:
+
+```
+anchor = top-left corner of the bounding box of all direct PAGE children
+x_new  = anchor.x + round((x - anchor.x) * factor)
+y_new  = anchor.y + round((y - anchor.y) * factor)
+```
+
+**Warum:** Ein einfaches `x * factor` würde Frames die weiter vom Ursprung entfernt sind stärker verschieben als nahe Frames, wodurch die Abstände zwischen Frames nach der Skalierung nicht mehr proportional zueinander wären. Die Anchor-Formel erhält die proportionalen Abstände.
+
+Verschachtelte Nodes (innerhalb eines Frames) verwenden weiterhin `scale(x, factor)`, da ihre Koordinaten bereits relativ zum Eltern-Frame angegeben sind und dort die Proportionen inherent korrekt sind.
+
+---
+
+## Grundprinzip: SCALE-Constraint
+
+Figma wende eine `SCALE`-Constraint automatisch an, wenn der **Parent-Frame** resized wird: der Node wird proportional zur Elterngrösse skaliert. Da das Plugin den Parent-Frame in Schritt 4 skaliert (bottom-up), wird ein SCALE-gebundener Node dadurch **automatisch** korrekt skaliert.
+
+Das Plugin darf eine solche Property **nicht** zusätzlich direkt schreiben — das würde eine Doppelskalierung verursachen:
+- `horizontal === 'SCALE'` → `x` und `width` nicht direkt schreiben
+- `vertical === 'SCALE'` → `y` und `height` nicht direkt schreiben
+
+Diese Prüfung (`hasScaleConstraint`) wird der Prüfreihenfolge (Variable → Style → Instance-Overwrite) als **vierte Bedingung** nachgestellt, bevor ein Wert geschrieben wird.
+
+**Ausnahme: VECTOR-Nodes.** Bei VECTORs kann nicht auf den Parent-Resize vertraut werden (siehe VECTOR-Grundprinzip unten). Dort werden SCALE-gebundene Achsen manuell skaliert und die Constraint danach zu MIN demoted.
+
+---
+
+## Grundprinzip: MAX-Constraint — Pre-Positioning
+
+Ein Node mit `horizontal === 'MAX'` hat einen **fixen Abstand zum rechten Rand** seines Eltern-Frames. Wenn der Eltern-Frame resized wird, repositioniert Figma den Node so, dass dieser Abstand konstant bleibt.
+
+Da das Plugin den Parent bottom-up noch **nicht** resized hat, wenn es den Child-Node bearbeitet, wäre ein naives `x_new = scale(x, factor)` falsch: beim späteren Parent-Resize würde Figma den Node nochmals verschieben und das Ergebnis wäre eine Fehlposition.
+
+Korrekte Formel:
+
+```
+x_pre = parentW − newParentW + scale(x, factor)
+```
+
+Dabei ist `newParentW` die Breite des Elterns nach seiner Skalierung (nur wenn `layoutSizingHorizontal === 'FIXED'`, sonst bleibt die Breite unverändert). Diese Formel setzt `x` so, dass der Node nach dem Parent-Resize exakt an der skalierten Position landet.
+
+Das gleiche gilt analog für `vertical === 'MAX'` mit `y` und der Höhe.
+
+---
+
+## Grundprinzip: GROUP-in-AutoLayout — Achsen-Unterdrückung
+
+Wenn ein Node Kind eines **GROUPs** ist, der selbst innerhalb eines **AutoLayout-Frames** liegt, speichert Figma die Koordinaten des Nodes im absoluten Koordinatenraum des AutoLayout-Frames (nicht relativ zum GROUP). Das hat eine kritische Konsequenz:
+
+- Auf der **AutoLayout-Achse** (x bei `HORIZONTAL`, y bei `VERTICAL`) repositioniert AutoLayout den GROUP automatisch. Wenn das Plugin diese Achse bei den GROUP-Kindern explizit skaliert, entsteht ein Konflikt — insbesondere bei TEXT-Nodes, bei denen `loadFontAsync` eine STRETCH-Constraint-Re-Evaluierung auslöst, die zu kaskadierten Positionsverschiebungen führt.
+- Die **Gegenachse** (y bei `HORIZONTAL`, x bei `VERTICAL`) wird von AutoLayout nicht gesteuert und muss weiterhin explizit skaliert werden.
+
+Regel: Bei Kindern eines GROUPs, der in einem AutoLayout-Frame liegt, wird die x-Koordinate (bei `HORIZONTAL`-Layout) bzw. y-Koordinate (bei `VERTICAL`-Layout) **nicht** geschrieben.
+
+---
+
+## Grundprinzip: TEXT — textAutoResize-Beibehaltung
+
+Der Figma-API-Aufruf `node.resize()` setzt `textAutoResize` immer auf `NONE` zurück, was die automatische Grössanpassung des Textfelds dauerhaft deaktiviert. Das Plugin muss je nach ursprünglichem Modus unterschiedlich vorgehen:
+
+| `textAutoResize` | Verhalten |
+|---|---|
+| `WIDTH_AND_HEIGHT` | Kein `resize()` — beide Dimensionen werden durch `fontSize` gesteuert; `scaleTextProperties` skaliert fontSize und der Text passt sich danach automatisch an |
+| `HEIGHT` | Nur Breite resizen (`resize(newW, oldH)`), danach `textAutoResize = 'HEIGHT'` explizit wiederherstellen, damit Höhe weiter auto-fittet |
+| `NONE` / `TRUNCATE` | Normales `resize()` — beide Dimensionen werden direkt gesetzt |
+
+---
+
+## Grundprinzip: VECTOR — Constraints und Parent-Resize
+
+VECTOR-Nodes werden manuell skaliert statt über den Parent-Resize, weil ein nicht-uniformer Resize die Pfadgeometrie und Image-Fill-Transforms dauerhaft verzerrt. Dabei gibt es zwei Sonderfälle bei Constraints:
+
+### SCALE-Constraint am VECTOR
+
+Constraint-Änderungen während einer Plugin-Transaktion werden nicht vor dem Parent-Resize-Aufruf in derselben Transaktion wirksam. Ein VECTOR mit `horizontal=SCALE, vertical=CENTER` würde daher beim Parent-Resize nur die Breite skalieren, die Höhe aber unverändert lassen — was eine Verzerrung erzeugt.
+
+Lösung: Der VECTOR wird **manuell und uniform** resized (gleicher Faktor auf beiden Achsen → keine Pfadverzerrung). Danach werden SCALE-Constraints auf MIN demoted, damit der Parent-Resize nicht doppelskaliert.
+
+### CENTER-Constraint am VECTOR (ohne SCALE)
+
+Figmas CENTER-Constraint behält einen **konstanten Offset** vom Mittelpunkt des Elterns — keine proportionale Fraktion. Nach einem Parent-Resize würde dieser konstante Offset den Node falsch positionieren.
+
+Lösung: Die Position wird manuell skaliert (`scaleExact(x, factor)`), danach wird CENTER auf MIN demoted, damit der Parent-Resize die manuell gesetzte Position nicht überschreibt.
+
+---
+
 ### Skalierte Properties pro Node
 
 Für jeden Node werden alle zutreffenden Properties geprüft und — nach bestandener Prüfreihenfolge (Variable → Style → Instance-Overwrite) — skaliert:
@@ -175,9 +264,9 @@ Für jeden Node werden alle zutreffenden Properties geprüft und — nach bestan
 - `topLeftRadius`, `topRightRadius`, `bottomLeftRadius`, `bottomRightRadius` — wenn `cornerRadius === Mixed` (jede Ecke einzeln)
 
 #### Stroke
-- `strokeWeight` — wenn Wert eine Zahl ist (nicht `Mixed`)
-- `strokeTopWeight`, `strokeBottomWeight`, `strokeLeftWeight`, `strokeRightWeight` — wenn `strokeWeight === Mixed` (jede Seite einzeln)
-- `dashPattern` — jeder Wert im Array skalieren (Strich- und Lückenlängen in Pixeln)
+- `strokeWeight` — wenn Wert eine Zahl ist (nicht `Mixed`); **ohne ganzzahlige Rundung** (scaleExact), da Strichbreiten Subpixelwerte sinnvoll nutzen
+- `strokeTopWeight`, `strokeBottomWeight`, `strokeLeftWeight`, `strokeRightWeight` — wenn `strokeWeight === Mixed` (jede Seite einzeln); ebenfalls ohne Rundung
+- `dashPattern` — jeder Wert im Array skalieren (Strich- und Lückenlängen in Pixeln); ohne Rundung
 
 #### Effects (direkt am Node, nicht via Style)
 - **Blur** (`BACKGROUND_BLUR`, `LAYER_BLUR`): `radius` skalieren
@@ -208,13 +297,16 @@ Für jeden Eintrag in `guides`: `offset` skalieren.
 ### Besondere Node-Typen
 
 #### VECTOR-Nodes
-`x`, `y`, `width`, `height` werden skaliert — **ohne ganzzahlige Rundung.** SVG-Pfadgeometrie verträgt Subpixelwerte und darf nicht willkürlich gerundet werden.
+`x`, `y`, `width`, `height` werden skaliert — **ohne ganzzahlige Rundung.** SVG-Pfadgeometrie verträgt Subpixelwerte und darf nicht willkürlich gerundet werden. Zusätzlich werden Stroke-Properties (`strokeWeight`, `dashPattern` etc.) wie bei anderen Nodes skaliert (ebenfalls ohne Rundung).
 
 #### GROUP-Nodes
 GROUPs haben keine eigene steuerbare Breite/Höhe — ihre Bounding Box ergibt sich aus den Kindern. Am GROUP-Node selbst werden **keine Properties geschrieben.** Die Kinder werden normal bottom-up traversiert und skaliert.
 
 #### BOOLEAN_OPERATION-Nodes
-Verhalten sich wie GROUP-Nodes: Die Bounding Box ergibt sich automatisch aus den Kind-Nodes. Am BOOLEAN_OPERATION-Node selbst werden **keine Properties geschrieben** ausser `x` und `y` (Position). Die Kinder werden normal bottom-up traversiert und skaliert.
+Verhalten sich **vollständig wie GROUP-Nodes**: Die Bounding Box ergibt sich automatisch aus den Kind-Nodes. Am BOOLEAN_OPERATION-Node selbst werden **keine Properties geschrieben** — auch nicht `x` und `y`. Da die Bottom-Up-Traversal die Kinder zuerst verschiebt und Figma die Bounding Box des BOOLEAN_OPERATION-Nodes danach automatisch anpasst, würde ein explizites Schreiben von `x`/`y` eine Doppelskalierung der Position verursachen. Die Kinder werden normal bottom-up traversiert und skaliert.
+
+#### SECTION-Nodes
+SECTIONs haben keine `layoutSizing`-Properties und unterstützen keinen direkten Resize über die normalen Property-Setter. Stattdessen wird `resizeWithoutConstraints(newW, newH)` verwendet. Position wird normal über `scalePosition` gesetzt.
 
 #### COMPONENT und COMPONENT_SET
 Werden wie reguläre Frames behandelt: bottom-up traversiert, alle zutreffenden Properties skaliert. Kind-COMPONENTs innerhalb eines COMPONENT_SETs werden als eigenständige Nodes traversiert.
@@ -238,9 +330,12 @@ Schritt 3: Effect & Paint Styles
 
 Schritt 4: Canvas
     └─▶ Bottom-Up-Traversal aller Nodes auf allen Pages (inkl. hidden)
-        Für jeden Node: Variable → Style → Instance-Overwrite prüfen, dann skalieren
-        GROUP-Nodes: nur Kinder traversieren, Node selbst nicht schreiben
-        VECTOR-Nodes: x, y, width, height ohne Rundung
+        Für jeden Node: Variable → Style → Instance-Overwrite → SCALE-Constraint prüfen
+        Top-Level-Nodes: Anchor-basierte Positionsskalierung
+        GROUP / BOOLEAN_OPERATION: nur Kinder traversieren, Node selbst nicht schreiben
+        SECTION: resizeWithoutConstraints()
+        VECTOR: manuell skalieren, SCALE/CENTER-Constraints danach demoten
+        TEXT: textAutoResize-Modus vor/nach resize() erhalten
         Instances: nur explizite Overwrites skalieren, keine neuen Overwrites erzeugen
         → alle Nodes sind danach korrekt skaliert
 ```
@@ -266,12 +361,15 @@ Schritt 4: Canvas
 | `counterAxisSpacing` wenn `layoutWrap !== 'WRAP'` | Property existiert in diesem Modus nicht sinnvoll |
 | `minWidth/maxWidth/minHeight/maxHeight` wenn `null` | Kein Constraint gesetzt |
 | `gridRowSizes`/`gridColumnSizes` mit `type !== 'FIXED'` | FLEX (fr-Einheiten) und HUG sind relativ, keine absoluten Pixelwerte |
-| GROUP-Node-Properties (ausser x/y) | Bounding Box ergibt sich aus Kindern, kein direkter Schreibzugriff |
-| BOOLEAN_OPERATION-Properties (ausser x/y) | Bounding Box ergibt sich aus Kindern, kein direkter Schreibzugriff |
+| `x`/`y` auf der AutoLayout-Achse bei GROUP-Kindern in AutoLayout | AutoLayout steuert diese Achse; explizites Schreiben kollidiert mit Auto-Repositionierung |
+| `x`/`width` wenn `horizontal === 'SCALE'` (ausser VECTOR) | Figma skaliert diese Achse beim Parent-Resize automatisch |
+| `y`/`height` wenn `vertical === 'SCALE'` (ausser VECTOR) | Figma skaliert diese Achse beim Parent-Resize automatisch |
+| GROUP-Node-Properties | Bounding Box ergibt sich aus Kindern, kein direkter Schreibzugriff |
+| BOOLEAN_OPERATION-Properties (inkl. x/y) | Bounding Box ergibt sich aus Kindern und wird automatisch aktualisiert; explizites x/y-Schreiben würde nach Bottom-Up-Traversal doppelskalieren |
 | Instance-Properties ohne Overwrite | Erben vom skalierten Master-Component |
 | Variable-gebundene Properties | Werden über Schritt 1 gesteuert |
 | Style-gebundene Properties | Werden über Schritt 2/3 gesteuert |
 
 ---
 
-*Spec-Version: 6.0 — Generisch, file-unabhängig, ohne Codebeispiele*
+*Spec-Version: 6.2 — Generisch, file-unabhängig, ohne Codebeispiele*
