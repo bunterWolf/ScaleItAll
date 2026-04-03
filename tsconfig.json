@@ -7,5 +7,5 @@
     "typeRoots": ["./node_modules/@figma"],
     "noEmitOnError": true
   },
-  "files": ["code.ts"]
+  "include": ["src/**/*.ts"]
 }

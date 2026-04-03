@@ -2,11 +2,12 @@
   "name": "scaleitall",
   "version": "1.0.0",
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc --watch"
+    "build": "esbuild src/main.ts --bundle --outfile=code.js --target=es2017",
+    "watch": "esbuild src/main.ts --bundle --outfile=code.js --target=es2017 --watch"
   },
   "devDependencies": {
     "@figma/plugin-typings": "*",
+    "esbuild": "^0.28.0",
     "typescript": "^5.0.0"
   }
 }
