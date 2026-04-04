@@ -337,21 +337,15 @@
       const newH = Math.max(MIN_DIM, scaleExact(oldH, factor));
       node.resize(newW, newH);
       node.constraints = {
-        horizontal: hC === "SCALE" ? "MIN" : hC,
-        vertical: vC === "SCALE" ? "MIN" : vC
+        horizontal: hC === "SCALE" || hC === "CENTER" ? "MIN" : hC,
+        vertical: vC === "SCALE" || vC === "CENTER" ? "MIN" : vC
       };
       if (shouldScaleXY) {
-        if ((hC === "SCALE" || hC === "MIN") && canWrite("x")) {
+        if ((hC === "SCALE" || hC === "MIN" || hC === "CENTER") && canWrite("x")) {
           node.x = isTopLevel ? anchor.x + (oldX - anchor.x) * factor : scaleExact(oldX, factor);
         }
-        if ((vC === "SCALE" || vC === "MIN") && canWrite("y")) {
+        if ((vC === "SCALE" || vC === "MIN" || vC === "CENTER") && canWrite("y")) {
           node.y = isTopLevel ? anchor.y + (oldY - anchor.y) * factor : scaleExact(oldY, factor);
-        }
-        if (hC === "CENTER" && canWrite("x")) {
-          node.x = oldX + (oldW - newW) / 2;
-        }
-        if (vC === "CENTER" && canWrite("y")) {
-          node.y = oldY + (oldH - newH) / 2;
         }
       }
       scaleStrokes(node, factor, canWrite);
@@ -434,13 +428,32 @@
     if (!shouldScaleXY) return;
     const isTopLevel = parent !== null && parent.type === "PAGE";
     const nodeConstraints = "constraints" in node ? node.constraints : null;
+    let wroteCenterX = false;
+    let wroteCenterY = false;
     if (!skipX && canWrite("x")) {
       const x = node.x;
       if (!isTopLevel && (nodeConstraints == null ? void 0 : nodeConstraints.horizontal) === "MAX" && parent !== null && "width" in parent) {
         const parentW = parent.width;
         const parentFixedW = "layoutSizingHorizontal" in parent && parent.layoutSizingHorizontal === "FIXED";
         const newParentW = parentFixedW ? scale(parentW, factor) : parentW;
-        node.x = parentW - newParentW + scale(x, factor);
+        const isWAH = node.type === "TEXT" && node.textAutoResize === "WIDTH_AND_HEIGHT" && "width" in node;
+        if (isWAH) {
+          const nodeW = node.width;
+          const rightDist = parentW - x - nodeW;
+          node.x = parentW - nodeW - scale(rightDist, factor);
+        } else {
+          node.x = parentW - newParentW + scale(x, factor);
+        }
+      } else if (!isTopLevel && (nodeConstraints == null ? void 0 : nodeConstraints.horizontal) === "CENTER" && parent !== null && "width" in parent) {
+        const parentW = parent.width;
+        const nodeW = node.width;
+        const centerOffset = x + nodeW / 2 - parentW / 2;
+        const parentFixedW = "layoutSizingHorizontal" in parent && parent.layoutSizingHorizontal === "FIXED";
+        const newParentW = parentFixedW ? scale(parentW, factor) : parentW;
+        const isNodeHugW = "layoutSizingHorizontal" in node && node.layoutSizingHorizontal === "HUG";
+        const newNodeW = isNodeHugW ? nodeW : scale(nodeW, factor);
+        node.x = newParentW / 2 + centerOffset - newNodeW / 2;
+        wroteCenterX = true;
       } else {
         node.x = isTopLevel ? anchor.x + Math.round((x - anchor.x) * factor) : scale(x, factor);
       }
@@ -451,9 +464,36 @@
         const parentH = parent.height;
         const parentFixedH = "layoutSizingVertical" in parent && parent.layoutSizingVertical === "FIXED";
         const newParentH = parentFixedH ? scale(parentH, factor) : parentH;
-        node.y = parentH - newParentH + scale(y, factor);
+        const isWAH = node.type === "TEXT" && node.textAutoResize === "WIDTH_AND_HEIGHT" && "height" in node;
+        if (isWAH) {
+          const nodeH = node.height;
+          const bottomDist = parentH - y - nodeH;
+          node.y = parentH - nodeH - scale(bottomDist, factor);
+        } else {
+          node.y = parentH - newParentH + scale(y, factor);
+        }
+      } else if (!isTopLevel && (nodeConstraints == null ? void 0 : nodeConstraints.vertical) === "CENTER" && parent !== null && "height" in parent) {
+        const parentH = parent.height;
+        const nodeH = node.height;
+        const centerOffset = y + nodeH / 2 - parentH / 2;
+        const parentFixedH = "layoutSizingVertical" in parent && parent.layoutSizingVertical === "FIXED";
+        const newParentH = parentFixedH ? scale(parentH, factor) : parentH;
+        const isNodeHugH = "layoutSizingVertical" in node && node.layoutSizingVertical === "HUG";
+        const newNodeH = isNodeHugH ? nodeH : scale(nodeH, factor);
+        node.y = newParentH / 2 + centerOffset - newNodeH / 2;
+        wroteCenterY = true;
       } else {
         node.y = isTopLevel ? anchor.y + Math.round((y - anchor.y) * factor) : scale(y, factor);
+      }
+    }
+    if (!isTopLevel && nodeConstraints !== null && (wroteCenterX || wroteCenterY)) {
+      const hC = nodeConstraints.horizontal;
+      const vC = nodeConstraints.vertical;
+      if (wroteCenterX || wroteCenterY) {
+        node.constraints = {
+          horizontal: wroteCenterX && hC === "CENTER" ? "MIN" : hC,
+          vertical: wroteCenterY && vC === "CENTER" ? "MIN" : vC
+        };
       }
     }
   }

@@ -42,27 +42,23 @@ export function scaleVectorNode(
 
     node.resize(newW, newH);
 
+    // Demote SCALE → MIN (prevents double-scaling by parent resize).
+    // Demote CENTER → MIN (prevents Figma from overriding the manually scaled position).
     (node as ConstraintMixin).constraints = {
-      horizontal: hC === 'SCALE' ? 'MIN' : hC,
-      vertical:   vC === 'SCALE' ? 'MIN' : vC,
+      horizontal: (hC === 'SCALE' || hC === 'CENTER') ? 'MIN' : hC,
+      vertical:   (vC === 'SCALE' || vC === 'CENTER') ? 'MIN' : vC,
     };
 
     if (shouldScaleXY) {
-      if ((hC === 'SCALE' || hC === 'MIN') && canWrite('x')) {
+      if ((hC === 'SCALE' || hC === 'MIN' || hC === 'CENTER') && canWrite('x')) {
         (node as any).x = isTopLevel
           ? anchor.x + (oldX - anchor.x) * factor
           : scaleExact(oldX, factor);
       }
-      if ((vC === 'SCALE' || vC === 'MIN') && canWrite('y')) {
+      if ((vC === 'SCALE' || vC === 'MIN' || vC === 'CENTER') && canWrite('y')) {
         (node as any).y = isTopLevel
           ? anchor.y + (oldY - anchor.y) * factor
           : scaleExact(oldY, factor);
-      }
-      if (hC === 'CENTER' && canWrite('x')) {
-        (node as any).x = oldX + (oldW - newW) / 2;
-      }
-      if (vC === 'CENTER' && canWrite('y')) {
-        (node as any).y = oldY + (oldH - newH) / 2;
       }
     }
 

@@ -48,6 +48,8 @@ Alle pixelgebundenen Werte werden mit dem Faktor multipliziert und **mathematisc
 
 **Globaler Minimalwert:** War der ursprüngliche Wert ≥ 1, beträgt der skalierte Wert mindestens 1 (d.h. `max(1, round(value × factor))`). War der ursprüngliche Wert < 1, wird normal skaliert ohne Minimum. Diese Regel gilt für alle direkt skalierten Properties in allen Schritten.
 
+**Hinweis zu negativen Werten:** Shadow-Offsets (`offset.x`, `offset.y`) können negativ sein. Die Minimalwert-Regel greift dort nicht (Wert < 1). Bei starker Verkleinerung kann ein Offset von z.B. `-1` auf `0` gerundet werden, wodurch die Richtung des Schattens verloren geht. Dies wird akzeptiert, da ein Sub-Pixel-Schatten in der Zielauflösung visuell nicht relevant ist.
+
 ---
 
 ## Verbot: Figma-interne Skalierungs-API
@@ -140,6 +142,8 @@ Enthält ein Paint Style einen Gradienten (`GRADIENT_LINEAR`, `GRADIENT_RADIAL`,
 
 Die Matrix ist eine 2×3 Affin-Transformationsmatrix. Die Rotationskoeffizienten (a, b, c, d) sind dimensionslos und werden nicht verändert. Nur e und f repräsentieren Positionswerte und werden mit dem Faktor multipliziert — **ohne ganzzahlige Rundung**, da es sich um Transformationskoeffizienten handelt.
 
+**⚠ Verifikationsbedarf:** Figmas `gradientTransform` bildet vom Gradienten-Koordinatenraum in die Bounding Box des Nodes ab. Falls e und f in **normalisierten Koordinaten** (0–1, relativ zur Node-Grösse) vorliegen, wären sie bereits grössenunabhängig und dürften **nicht** skaliert werden — die Node-Resize in Schritt 4 würde den Gradienten automatisch korrekt positionieren. Falls e und f hingegen in **absoluten Pixeln** vorliegen, ist die Skalierung korrekt. Dies muss gegen die aktuelle Figma-API verifiziert werden.
+
 `GRADIENT_DIAMOND` wird stillschweigend übersprungen.
 
 ---
@@ -152,7 +156,7 @@ Alle Nodes auf allen Pages werden **bottom-up** traversiert und skaliert — Bla
 
 ## Grundprinzip: Top-Level-Positionierung via Anchor
 
-Top-Level-Nodes (direkte Kinder einer PAGE) werden **nicht** einfach mit `x * factor` skaliert. Stattdessen wird die Position relativ zum **Bounding-Box-Anker** aller Top-Level-Frames berechnet:
+Top-Level-Nodes (direkte Kinder einer PAGE) werden **nicht** einfach mit `x * factor` skaliert. Stattdessen wird die Position relativ zum **Bounding-Box-Anker** aller Top-Level-Frames berechnet. Der Anker wird **einmal pro Page** vor Beginn der Traversierung berechnet und bleibt während der gesamten Page-Verarbeitung konstant — er darf nicht nach jeder Node-Repositionierung neu berechnet werden, da sich die Bounding Box sonst verschieben und die Proportionen verzerren würde.
 
 ```
 anchor = top-left corner of the bounding box of all direct PAGE children
@@ -184,7 +188,9 @@ Diese Prüfung (`hasScaleConstraint`) wird der Prüfreihenfolge (Variable → St
 
 Ein Node mit `horizontal === 'MAX'` hat einen **fixen Abstand zum rechten Rand** seines Eltern-Frames. Wenn der Eltern-Frame resized wird, repositioniert Figma den Node so, dass dieser Abstand konstant bleibt.
 
-Da das Plugin den Parent bottom-up noch **nicht** resized hat, wenn es den Child-Node bearbeitet, wäre ein naives `x_new = scale(x, factor)` falsch: beim späteren Parent-Resize würde Figma den Node nochmals verschieben und das Ergebnis wäre eine Fehlposition.
+Da das Plugin den Parent bottom-up noch **nicht** resized hat, wenn es den Child-Node bearbeitet, muss `x` auf einen Vorab-Wert gesetzt werden, sodass nach dem späteren Parent-Resize die korrekte Endposition resultiert. Dieses Prinzip gilt für alle nicht-`WIDTH_AND_HEIGHT`-Nodes.
+
+### Fall 1: Nicht-`WIDTH_AND_HEIGHT`-Text und alle anderen Nodes
 
 Korrekte Formel:
 
@@ -192,9 +198,54 @@ Korrekte Formel:
 x_pre = parentW − newParentW + scale(x, factor)
 ```
 
-Dabei ist `newParentW` die Breite des Elterns nach seiner Skalierung (nur wenn `layoutSizingHorizontal === 'FIXED'`, sonst bleibt die Breite unverändert). Diese Formel setzt `x` so, dass der Node nach dem Parent-Resize exakt an der skalierten Position landet.
+Dabei ist `newParentW` die Breite des Elterns nach seiner Skalierung (nur wenn `layoutSizingHorizontal === 'FIXED'`, sonst `newParentW = parentW`). Diese Formel setzt `x` so, dass der Node nach dem Parent-Resize exakt an der skalierten Position landet.
 
-Das gleiche gilt analog für `vertical === 'MAX'` mit `y` und der Höhe.
+### Fall 2: TEXT-Node mit `textAutoResize === 'WIDTH_AND_HEIGHT'`
+
+Bei diesen Nodes gibt es eine dreistufige Kaskade, die eine andere Formel erfordert:
+
+1. **`scalePosition`** setzt `x` auf einen Vorab-Wert (dieser Schritt)
+2. **`scaleTextProperties`** ändert `fontSize` → Figma löst `WIDTH_AND_HEIGHT`-Auto-Resize aus → da der Node `MAX`-Constraint hat, **pinnt Figma die rechte Kante** auf `x + originalWidth` und berechnet `x` neu
+3. **`scaleSize` des Parent-Frames** resized den Frame → Figma hält den aktuellen `rightDist` konstant
+
+Die richtige Endposition ergibt sich nur, wenn vor Schritt 3 gilt:
+`rightDist_in_originalFrame = scale(originalRightDist, factor)`
+
+Das bedeutet: der Vorab-Wert aus Schritt 1 muss so gewählt sein, dass nach der automatischen Verschiebung in Schritt 2 der `rightDist` genau dem skalierten Wert entspricht.
+
+Herleitung:
+```
+rightDist        = parentW − x − nodeW       (nodeW = Breite VOR Font-Resize)
+desiredRightDist = scale(rightDist, factor)
+
+Ziel: Nach Schritt 2 soll rightDist_after = desiredRightDist gelten.
+
+Schritt 2 pinnt die rechte Kante bei x_pre + nodeW.
+Nach Font-Resize ändert sich die Breite auf newW, rechte Kante bleibt:
+  x_after = (x_pre + nodeW) − newW
+
+rightDist_after = parentW − x_after − newW
+               = parentW − (x_pre + nodeW − newW) − newW
+               = parentW − x_pre − nodeW
+
+Setze rightDist_after = desiredRightDist:
+  parentW − x_pre − nodeW = desiredRightDist
+  x_pre = parentW − nodeW − desiredRightDist
+```
+
+Korrekte Formel (exakt, keine Approximation):
+```
+x_pre = parentW − nodeW − scale(rightDist, factor)
+      = parentW − nodeW − scale(parentW − x − nodeW, factor)
+```
+
+**Hinweis:** `newW` kürzt sich in der Herleitung vollständig heraus — die Formel ist unabhängig von der Breite nach dem Font-Resize.
+
+**Warum `scale(x, factor)` falsch ist:** Damit landet `x_after_fontresize` bei `parentW − nodeW − rightDist_original`, d.h. der `rightDist` bleibt unverändert — er skaliert nicht mit.
+
+**Warum die Standard-Formel `parentW − newParentW + scale(x, factor)` falsch ist:** Sie ignoriert die Kaskade aus Schritt 2 und setzt `x_pre` zu gross, was nach dem Font-Resize zu einem weit nach rechts verschobenen Node führt.
+
+Das gleiche gilt analog für `vertical === 'MAX'` mit `textAutoResize === 'WIDTH_AND_HEIGHT'`, wobei `y`, `height` und `bottomDist` verwendet werden.
 
 ---
 
@@ -227,15 +278,39 @@ VECTOR-Nodes werden manuell skaliert statt über den Parent-Resize, weil ein nic
 
 ### SCALE-Constraint am VECTOR
 
-Constraint-Änderungen während einer Plugin-Transaktion werden nicht vor dem Parent-Resize-Aufruf in derselben Transaktion wirksam. Ein VECTOR mit `horizontal=SCALE, vertical=CENTER` würde daher beim Parent-Resize nur die Breite skalieren, die Höhe aber unverändert lassen — was eine Verzerrung erzeugt.
+Ein Parent-Resize auf einen VECTOR mit `SCALE`-Constraint wäre problematisch: Hat der VECTOR z.B. `horizontal=SCALE, vertical=CENTER`, skaliert der Parent-Resize nur die Breite, nicht die Höhe — was die Pfadgeometrie **nicht-uniform** verzerrt.
 
-Lösung: Der VECTOR wird **manuell und uniform** resized (gleicher Faktor auf beiden Achsen → keine Pfadverzerrung). Danach werden SCALE-Constraints auf MIN demoted, damit der Parent-Resize nicht doppelskaliert.
+Lösung: Der VECTOR wird **manuell und uniform** resized (gleicher Faktor auf beiden Achsen → keine Pfadverzerrung). Danach werden `SCALE`- **und** `CENTER`-Constraints auf `MIN` demoted, damit der Parent-Resize weder doppelskaliert noch die manuell gesetzte Position überschreibt. Die Demotion wirkt sofort, da die Bottom-Up-Traversierung den Child vor dem Parent verarbeitet und Figma Property-Änderungen zwischen API-Aufrufen sofort übernimmt.
 
 ### CENTER-Constraint am VECTOR (ohne SCALE)
 
 Figmas CENTER-Constraint behält einen **konstanten Offset** vom Mittelpunkt des Elterns — keine proportionale Fraktion. Nach einem Parent-Resize würde dieser konstante Offset den Node falsch positionieren.
 
-Lösung: Die Position wird manuell skaliert (`scaleExact(x, factor)`), danach wird CENTER auf MIN demoted, damit der Parent-Resize die manuell gesetzte Position nicht überschreibt.
+Lösung: Identisch zum allgemeinen CENTER-Prinzip (siehe unten): Offset zurückrechnen, Zielposition direkt berechnen, danach CENTER → MIN demoten.
+
+### CENTER-Constraint an allen anderen Nodes
+
+CENTER-Constraint bedeutet: Figma speichert einen konstanten Offset vom Mittelpunkt des Elterns (`offset = node_center − parent_center`). Beim Parent-Resize repositioniert Figma den Node: `x = new_parent_center + offset − node_w/2`.
+
+Ein einfaches `scale(x)` ist hier falsch, aus zwei Gründen:
+
+**Problem 1 — HUG-Frames und Bottom-Up-Traversal:** Wenn Kinder-Nodes zuerst skaliert werden (bottom-up) und dieser Node ein HUG-Frame ist, resized Figma ihn automatisch. CENTER feuert sofort und repositioniert den Node. Wenn `scalePosition` danach läuft, liest es das bereits verschobene x — nicht das Original. `scale(verschobenes_x)` ergibt einen falschen Wert.
+
+**Problem 2 — Korrumpierter Offset nach Parent-Resize:** Wenn wir `scale(x)` schreiben, ändert sich der gespeicherte CENTER-Offset. Beim späteren Parent-Resize feuert CENTER mit dem falschen Offset und überschreibt x erneut.
+
+**Lösung:** Den gespeicherten CENTER-Offset aus den aktuellen Werten zurückrechnen (er ist stabil durch HUG-Resize hindurch, weil CENTER ihn immer erhält) und die Zielposition direkt berechnen:
+
+```
+offset = (current_x + current_w/2) − parent_w/2    // stabil trotz HUG-Resize
+new_x  = new_parent_center + offset − new_node_w/2
+
+// new_parent_center = scale(parent_w)/2  wenn Parent FIXED
+//                   = parent_w/2          wenn Parent HUG/FILL (bereits am Zielwert)
+// new_node_w = current_w                  wenn Node HUG (Kinder-Resize hat es bereits gesetzt)
+//            = scale(current_w)           wenn Node FIXED (scaleSize wird es danach setzen)
+```
+
+Danach CENTER → MIN demoten (nur die Achsen, auf denen x/y geschrieben wurde), damit der Parent-Resize die manuell berechnete Position nicht überschreibt.
 
 ---
 
@@ -247,6 +322,10 @@ Für jeden Node werden alle zutreffenden Properties geprüft und — nach bestan
 - `x`, `y` — skalieren, **wenn:**
   - Parent ist kein AutoLayout-Frame, **oder**
   - Node hat `layoutPositioning === 'ABSOLUTE'` (absolut positioniert innerhalb eines AutoLayout-Frames)
+- **MIN / kein Constraint:** `scale(x, factor)` — einfache proportionale Skalierung
+- **MAX:** Pre-Positioning-Formel (siehe Grundprinzip: MAX-Constraint)
+- **CENTER:** Offset-Formel (siehe Grundprinzip: CENTER-Constraint) — danach CENTER → MIN demoten
+- **SCALE:** nicht schreiben (ausser VECTOR) — Parent-Resize übernimmt das automatisch
 
 #### Grösse
 - `width` — skalieren, wenn `layoutSizingHorizontal === 'FIXED'`
@@ -335,6 +414,7 @@ Schritt 4: Canvas
         GROUP / BOOLEAN_OPERATION: nur Kinder traversieren, Node selbst nicht schreiben
         SECTION: resizeWithoutConstraints()
         VECTOR: manuell skalieren, SCALE/CENTER-Constraints danach demoten
+        CENTER-Constraint (alle Nodes): Offset zurückrechnen, Zielposition direkt berechnen, danach CENTER → MIN demoten
         TEXT: textAutoResize-Modus vor/nach resize() erhalten
         Instances: nur explizite Overwrites skalieren, keine neuen Overwrites erzeugen
         → alle Nodes sind danach korrekt skaliert
@@ -351,7 +431,7 @@ Schritt 4: Canvas
 | Opacity | Kein Pixelwert |
 | `lineHeight` mit `unit !== 'PIXELS'` | Skaliert sich implizit mit fontSize |
 | `letterSpacing` mit `unit !== 'PIXELS'` | Relativ zum Font, kein absoluter Pixelwert |
-| `paragraphSpacing`, `paragraphIndent` | Typografische Entscheidung, kein Layoutwert |
+| `paragraphSpacing`, `paragraphIndent` | Bewusste Design-Entscheidung: anders als `listSpacing` (Layout-Abstand) sind diese Werte typografische Feineinstellungen, die oft absichtlich nicht proportional zur Auflösung gewählt werden. Falls ein Projekt proportionale Skalierung wünscht, kann dies als Erweiterung ergänzt werden. |
 | Component-Property-Namen und Varianten-Werte | Bezeichner, keine Pixelwerte |
 | IMAGE fills | Keine skalierbaren Geometriewerte |
 | `gradientTransform` Rotationskoeffizienten (a–d) | Dimensionslos, keine Pixelwerte |
@@ -372,4 +452,4 @@ Schritt 4: Canvas
 
 ---
 
-*Spec-Version: 6.2 — Generisch, file-unabhängig, ohne Codebeispiele*
+*Spec-Version: 6.3 — Generisch, file-unabhängig, ohne Codebeispiele*
